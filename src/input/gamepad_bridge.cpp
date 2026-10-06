@@ -46,31 +46,39 @@ static void inject_button(int deviceId, uint32_t buttonMask, int action) {
     }
 }
 
+// 0 = Idle, 1 = Down requested, 2 = Down active, 3 = Up requested
+static int s_pause_state = 0;
+
 void GamePadMgrBridge::dispatchStartPress(int is_down) {
-    printf("[Input] Start / Pause button %s\n", is_down ? "PRESSED" : "RELEASED");
-    int action = is_down ? 0 : 1;
+    // Exact Vita mapping: AKEYCODE_BUTTON_SELECT (109) with pure AINPUT_SOURCE_KEYBOARD
+    MockInputEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type      = AINPUT_EVENT_TYPE_KEY;
+    ev.source    = AINPUT_SOURCE_KEYBOARD; // Exactly AINPUT_SOURCE_KEYBOARD (no bitwise OR)
+    ev.deviceId  = 0;
+    ev.keyCode   = AKEYCODE_BUTTON_SELECT; // 109
+    ev.keyAction = is_down ? AKEY_EVENT_ACTION_DOWN : AKEY_EVENT_ACTION_UP;
+    dispatch_raw_input_event(&ev);
+}
 
-    if (g_pGamePadMgr) {
-        for (int i = 0; i < 16; i++) {
-            uint8_t* pad = g_pGamePadMgr + (i * 36);
-            auto* pActive = reinterpret_cast<uint8_t*>(pad + 0x04);
-            auto* pDevId  = reinterpret_cast<int32_t*>(pad + 0x00);
-            auto* pSupported = reinterpret_cast<uint32_t*>(pad + 0x20);
+void GamePadMgrBridge::dispatchButton(int android_code, int is_down) {
+    if (android_code == 0) return;
 
-            if (i == 0 && !(*pActive)) {
-                *pActive = 1;
-                *pDevId = 1;
-            }
-            if (*pActive) {
-                *pSupported |= (1 << 8); // Start button bit
-                if (is_down) {
-                    *reinterpret_cast<uint8_t*>(pad + 0x0E) = 1; // m_pauseTrigger
-                    *reinterpret_cast<uint8_t*>(pad + 0x0D) = 1; // m_pauseActive
-                }
-            }
-        }
-        inject_button(1, 0x8000, action);
-        inject_button(1, 0x0100, action);
+    // R1 Macro: A + B + K (Horizontal + Vertical + Kick) like the Vita port
+    if (android_code == AKEYCODE_BUTTON_R1) {
+        int action = is_down ? AKEY_EVENT_ACTION_DOWN : AKEY_EVENT_ACTION_UP;
+        
+        MockInputEvent e;
+        memset(&e, 0, sizeof(e));
+        e.type     = AINPUT_EVENT_TYPE_KEY;
+        e.source   = AINPUT_SOURCE_GAMEPAD;
+        e.deviceId = 1;
+        e.keyAction = action;
+
+        e.keyCode = AKEYCODE_BUTTON_Y; dispatch_raw_input_event(&e);
+        e.keyCode = AKEYCODE_BUTTON_B; dispatch_raw_input_event(&e);
+        e.keyCode = AKEYCODE_BUTTON_X; dispatch_raw_input_event(&e);
+        return;
     }
 
     MockInputEvent ev;
@@ -78,33 +86,16 @@ void GamePadMgrBridge::dispatchStartPress(int is_down) {
     ev.type      = AINPUT_EVENT_TYPE_KEY;
     ev.source    = AINPUT_SOURCE_GAMEPAD;
     ev.deviceId  = 1;
-    ev.keyCode   = AKEYCODE_BUTTON_START;
-    ev.keyAction = is_down ? AKEY_EVENT_ACTION_DOWN : AKEY_EVENT_ACTION_UP;
-    dispatch_raw_input_event(&ev);
-
-    ev.source  = AINPUT_SOURCE_KEYBOARD;
-    ev.keyCode = AKEYCODE_ESCAPE;
-    dispatch_raw_input_event(&ev);
-}
-
-void GamePadMgrBridge::dispatchButton(int android_code, int is_down) {
-    if (android_code == 0) return;
-    MockInputEvent ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.type      = AINPUT_EVENT_TYPE_KEY;
-    ev.source    = AINPUT_SOURCE_GAMEPAD | AINPUT_SOURCE_KEYBOARD;
-    ev.deviceId  = 1;
     ev.keyCode   = android_code;
     ev.keyAction = is_down ? AKEY_EVENT_ACTION_DOWN : AKEY_EVENT_ACTION_UP;
     dispatch_raw_input_event(&ev);
 }
-
 void GamePadMgrBridge::dispatchDpad(int android_code, int is_down) {
     if (android_code == 0) return;
     MockInputEvent ev;
     memset(&ev, 0, sizeof(ev));
     ev.type      = AINPUT_EVENT_TYPE_KEY;
-    ev.source    = AINPUT_SOURCE_KEYBOARD | AINPUT_SOURCE_DPAD;
+    ev.source    = AINPUT_SOURCE_DPAD;
     ev.deviceId  = 1;
     ev.keyCode   = android_code;
     ev.keyAction = is_down ? AKEY_EVENT_ACTION_DOWN : AKEY_EVENT_ACTION_UP;

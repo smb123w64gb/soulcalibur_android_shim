@@ -1,11 +1,15 @@
 #include "core/elf_loader.h"
 #include "core/hooks.h"
+#include "audio/opensles_mock.h"
 #include "input/gamepad_bridge.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <windows.h>
 
+// -----------------------------------------------------------------------------
+// Self-Contained ELF32 Definitions
+// -----------------------------------------------------------------------------
 typedef struct {
     uint8_t  e_ident[16];
     uint16_t e_type, e_machine;
@@ -51,28 +55,6 @@ typedef struct {
 #define R_386_GLOB_DAT 6
 #define R_386_JMP_SLOT 7
 #define R_386_RELATIVE 8
-extern "C" void set_soundplayer3_tick_queue(void* fn);
-typedef void (*NrPng_setData_t)(void* nrPng, const char* data, int size);
-static NrPng_setData_t real_NrPng_setData = nullptr;
-
-static void hook_NrPng_setData(void* nrPng, const char* data, int size) {
-    if (!data || size < 8) {
-        printf("[NrPng] Skipping invalid/empty data (%d bytes)\n", size);
-        return;
-    }
-
-    const uint8_t* u = reinterpret_cast<const uint8_t*>(data);
-    // Check PNG signature: 89 50 4E 47 0D 0A 1A 0A
-    if (u[0] != 0x89 || u[1] != 0x50 || u[2] != 0x4E || u[3] != 0x47) {
-        printf("[NrPng] Skipping non-PNG data (%d bytes, magic: %02X %02X %02X %02X)\n",
-               size, u[0], u[1], u[2], u[3]);
-        return;
-    }
-
-    if (real_NrPng_setData) {
-        real_NrPng_setData(nrPng, data, size);
-    }
-}
 
 static void trap_unresolved_symbol() {
     printf("\n[FATAL] Executed an unresolved symbol stub!\n");
@@ -80,6 +62,88 @@ static void trap_unresolved_symbol() {
     exit(1);
 }
 
+// -----------------------------------------------------------------------------
+// NrPng Protection Hook (Prevents Crash on Non-PNG Payloads)
+// -----------------------------------------------------------------------------
+static const uint8_t s_fallback_png[67] = {
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89,
+    0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54,
+    0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+    0xAE, 0x42, 0x60, 0x82
+};
+
+typedef void (*NrPng_setData_t)(void* nrPng, const char* data, int size);
+static NrPng_setData_t real_NrPng_setData = nullptr;
+static uint8_t s_nrpng_orig_bytes[5] = {0};
+
+static void patch_nrpng_trampoline(void* target, bool install);
+
+static void hook_NrPng_setData(void* nrPng, const char* data, int size) {
+    const char* use_data = data;
+    int use_size = size;
+
+    if (!data || size < 8) {
+        printf("[NrPng] Skipping invalid/empty data (%d bytes) -> using 1x1 fallback\n", size);
+        use_data = reinterpret_cast<const char*>(s_fallback_png);
+        use_size = sizeof(s_fallback_png);
+    } else {
+        const uint8_t* u = reinterpret_cast<const uint8_t*>(data);
+        if (u[0] != 0x89 || u[1] != 0x50 || u[2] != 0x4E || u[3] != 0x47) {
+            printf("[NrPng] Non-PNG data (%d bytes, magic: %02X %02X %02X %02X) -> using 1x1 fallback\n",
+                   size, u[0], u[1], u[2], u[3]);
+            use_data = reinterpret_cast<const char*>(s_fallback_png);
+            use_size = sizeof(s_fallback_png);
+        }
+    }
+
+    if (real_NrPng_setData) {
+        patch_nrpng_trampoline(reinterpret_cast<void*>(real_NrPng_setData), false);
+        real_NrPng_setData(nrPng, use_data, use_size);
+        patch_nrpng_trampoline(reinterpret_cast<void*>(real_NrPng_setData), true);
+    }
+}
+
+static void patch_nrpng_trampoline(void* target, bool install) {
+    if (!target) return;
+    uint8_t* p = reinterpret_cast<uint8_t*>(target);
+    DWORD oldProt;
+    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProt);
+
+    if (install) {
+        if (s_nrpng_orig_bytes[0] == 0) {
+            memcpy(s_nrpng_orig_bytes, p, 5);
+        }
+        uint32_t rel = reinterpret_cast<uint32_t>(hook_NrPng_setData) - (reinterpret_cast<uint32_t>(p) + 5);
+        uint8_t jmp[5] = { 0xE9, 0, 0, 0, 0 };
+        memcpy(&jmp[1], &rel, 4);
+        memcpy(p, jmp, 5);
+    } else {
+        memcpy(p, s_nrpng_orig_bytes, 5);
+    }
+
+    VirtualProtect(p, 5, oldProt, &oldProt);
+}
+
+// -----------------------------------------------------------------------------
+// Voice Engine Diagnostics
+// -----------------------------------------------------------------------------
+typedef void (*SoundEngine_playVoice_t)(void* engine, int charId, int voiceId, float pitch);
+static SoundEngine_playVoice_t real_SoundEngine_playVoice = nullptr;
+
+static void hook_SoundEngine_playVoice(void* engine, int charId, int voiceId, float pitch) {
+    printf("[Voice Play] charId=%d, voiceId=%d, requested_pitch=%.4f\n", charId, voiceId, pitch);
+    if (real_SoundEngine_playVoice) {
+        real_SoundEngine_playVoice(engine, charId, voiceId, pitch);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Symbol Finding and Relocation
+// -----------------------------------------------------------------------------
 void* find_symbol(LoadedSO* so, const char* target_name) {
     if (!so->symtab || !so->strtab) return nullptr;
     auto* symtab = reinterpret_cast<Elf32_Sym*>(so->symtab);
@@ -193,7 +257,7 @@ bool load_elf_so(const char* filename, LoadedSO* out) {
     }
     printf("[Loader] Relocations applied successfully.\n");
 
-    // In-Memory Patches: Licensing & Data Path
+    // In-Memory Engine Patches
     void* lic = find_symbol(out, "_Z19waitForLicenseCheckP11android_appP6engine");
     if (!lic) lic = base + 0x000c99c0;
     uint8_t ret1[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; // mov eax, 1; ret
@@ -211,7 +275,6 @@ bool load_elf_so(const char* filename, LoadedSO* out) {
         memcpy(gdp, patch_path, sizeof(patch_path));
     }
 
-    // SoundPlayer3 assertions and deadlock bypass
     uint8_t* play_check = base + 0x000fd1bc;
     if (play_check[0] == 0x74 && play_check[1] == 0x63) {
         play_check[0] = 0x90; play_check[1] = 0x90;
@@ -220,69 +283,46 @@ bool load_elf_so(const char* filename, LoadedSO* out) {
     if (thread_loop[0] == 0x75 && thread_loop[1] == 0x5B) {
         thread_loop[0] = 0xEB;
     }
+
     void* sp3_tick = find_symbol(out, "SoundPlayer3_tickQueue");
     if (!sp3_tick) sp3_tick = find_symbol(out, "_Z22SoundPlayer3_tickQueueP12SoundPlayer3i");
     if (!sp3_tick) sp3_tick = find_symbol(out, "_ZN12SoundPlayer39tickQueueEi");
-    if (!sp3_tick) sp3_tick = find_symbol(out, "_ZN12SoundPlayer310tickQueue_Ei");
     if (sp3_tick) {
         set_soundplayer3_tick_queue(sp3_tick);
-        printf("[Audio] Found SoundPlayer3_tickQueue at %p\n", sp3_tick);
-    } else {
-        printf("[Audio] WARNING: Could not resolve SoundPlayer3_tickQueue!\n");
+        printf("[Audio] Registered SoundPlayer3_tickQueue at %p\n", sp3_tick);
     }
 
-    // Initialize GamePadMgr bridge
+    typedef void (*nrthread_ctor_t)(void*);
+    auto nrthread_ctor = reinterpret_cast<nrthread_ctor_t>(base + 0x000dae10);
+    void* sp3_inst = find_symbol(out, "_ZN12SoundPlayer38instanceE");
+    if (!sp3_inst) sp3_inst = find_symbol(out, "_ZN12SoundPlayer312soundPlayer3E");
+    if (sp3_inst) {
+        void** thread_ptr = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(sp3_inst) + 0x30);
+        nrthread_ctor(thread_ptr);
+    }
+
     void* padMgr = find_symbol(out, "GamePadMgr_gamePadMgr");
     if (!padMgr) padMgr = find_symbol(out, "_ZN10GamePadMgr10gamePadMgrE");
     void* setBtn = find_symbol(out, "_ZN10GamePadMgr9setButtonEiji");
     GamePadMgrBridge::init(padMgr, setBtn);
-    // Call NrThread constructor for SoundPlayer3
-    typedef void (*nrthread_ctor_t)(void*);
-    nrthread_ctor_t nrthread_ctor = (nrthread_ctor_t)(base + 0x000dae10);
-    void *sp3_inst = find_symbol(out, "_ZN12SoundPlayer38instanceE");
-    if (!sp3_inst) sp3_inst = find_symbol(out, "_ZN12SoundPlayer312soundPlayer3E");
-    if (sp3_inst) {
-        void **thread_ptr = (void**)((uint8_t*)sp3_inst + 0x30);
-        printf("[Init] SoundPlayer3 found, calling NrThread ctor at %p\n", thread_ptr);
-        nrthread_ctor(thread_ptr);
-    }
+
+    // NrPng::setData Entry Hook
     real_NrPng_setData = reinterpret_cast<NrPng_setData_t>(find_symbol(out, "_ZN5NrPng7setDataEPKci"));
-    if (!real_NrPng_setData) {
-        real_NrPng_setData = reinterpret_cast<NrPng_setData_t>(find_symbol(out, "NrPng_setData"));
-    }
-    printf("[Patch] NrPng::setData resolved at %p\n", real_NrPng_setData);
-
-    // Patch the PLT / GOT redirection or hook point if exported
-    HookRegistry::getInstance().registerHook("_ZN5NrPng7setDataEPKci", reinterpret_cast<void*>(hook_NrPng_setData));
-    HookRegistry::getInstance().registerHook("NrPng_setData", reinterpret_cast<void*>(hook_NrPng_setData));
+    if (!real_NrPng_setData) real_NrPng_setData = reinterpret_cast<NrPng_setData_t>(find_symbol(out, "NrPng_setData"));
     if (real_NrPng_setData) {
-        uint8_t* p = reinterpret_cast<uint8_t*>(real_NrPng_setData);
-        uint32_t rel_offset = (uint32_t)hook_NrPng_setData - ((uint32_t)p + 5);
-        uint8_t jmp_patch[5] = { 0xE9, 0, 0, 0, 0 };
-        memcpy(&jmp_patch[1], &rel_offset, 4);
+        patch_nrpng_trampoline(reinterpret_cast<void*>(real_NrPng_setData), true);
+        printf("[Patch] Hooked NrPng::setData entry point\n");
+    }
 
-        DWORD oldProtect;
-        VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-        memcpy(p, jmp_patch, 5);
-        VirtualProtect(p, 5, oldProtect, &oldProtect);
-        printf("[Patch] Successfully hooked NrPng::setData entry point\n");
+    // Voice Engine Diagnostics
+    real_SoundEngine_playVoice = reinterpret_cast<SoundEngine_playVoice_t>(
+        find_symbol(out, "_ZN11SoundEngine9playVoiceEiif"));
+    if (real_SoundEngine_playVoice) {
+        HookRegistry::getInstance().registerHook("_ZN11SoundEngine9playVoiceEiif", 
+            reinterpret_cast<void*>(hook_SoundEngine_playVoice));
     }
-    // Patch NrPng::makeBitmap to return safely if width is 0 (prevents Line 186 halt)
-    void* makeBitmap = find_symbol(out, "_ZN5NrPng10makeBitmapEv");
-    if (!makeBitmap) makeBitmap = find_symbol(out, "NrPng_makeBitmap");
-    if (makeBitmap) {
-        uint8_t* p = reinterpret_cast<uint8_t*>(makeBitmap);
-        // mov eax, [ecx+0x14] ; test eax, eax ; jnz +2 ; ret
-        // 8B 41 14 85 C0 75 01 C3
-        uint8_t safe_check[] = { 0x8B, 0x41, 0x14, 0x85, 0xC0, 0x75, 0x01, 0xC3 };
-        
-        DWORD oldProtect;
-        VirtualProtect(p, sizeof(safe_check), PAGE_EXECUTE_READWRITE, &oldProtect);
-        memcpy(p, safe_check, sizeof(safe_check));
-        VirtualProtect(p, sizeof(safe_check), oldProtect, &oldProtect);
-        printf("[Patch] Patched NrPng::makeBitmap to prevent Line 186 halt on invalid PNGs\n");
-    }
-    // Run INIT_ARRAY constructors
+
+    // Execute INIT_ARRAY Constructors
     if (init_array && init_array_sz > 0) {
         int count = init_array_sz / sizeof(uint32_t);
         printf("[Loader] Executing %d constructors from INIT_ARRAY...\n", count);

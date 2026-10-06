@@ -92,7 +92,7 @@ typedef struct {
     MockPlayerRate   rate;
 
     float            volume_scale;
-    uint32_t         play_state; // 1 = STOPPED, 2 = PAUSED, 3 = PLAYING
+    uint32_t         play_state;
 
     int              src_channels;
     int              src_rate;
@@ -106,7 +106,6 @@ typedef struct {
 #define MAX_ACTIVE_PLAYERS 32
 static MockAudioPlayer* g_active_players[MAX_ACTIVE_PLAYERS] = {nullptr};
 
-// Low-power audio synchronization handles (Single definition)
 static SDL_mutex*        g_audio_mutex     = nullptr;
 static SDL_cond*         g_audio_cond      = nullptr;
 static SDL_Thread*       g_audio_thread    = nullptr;
@@ -125,7 +124,7 @@ extern "C" void set_soundplayer3_tick_queue(void* fn) {
 
 static int32_t __cdecl mock_sl_ok(void* self, ...) { return 0; }
 
-// --- Volume Interface ---
+// Volume Interface
 static int32_t __cdecl mock_sl_volume_set_level(void* self, int16_t level) {
     auto* vol = reinterpret_cast<MockPlayerVolume*>(self);
     if (vol && vol->parent_player) {
@@ -142,6 +141,7 @@ static int32_t __cdecl mock_sl_volume_set_level(void* self, int16_t level) {
     }
     return 0;
 }
+
 static int32_t __cdecl mock_sl_volume_get_level(void* self, int16_t* pLevel) {
     if (pLevel) {
         auto* vol = reinterpret_cast<MockPlayerVolume*>(self);
@@ -149,12 +149,13 @@ static int32_t __cdecl mock_sl_volume_get_level(void* self, int16_t* pLevel) {
     }
     return 0;
 }
+
 static int32_t __cdecl mock_sl_volume_get_max(void* self, int16_t* pMaxLevel) {
     if (pMaxLevel) *pMaxLevel = 0;
     return 0;
 }
 
-// --- PlaybackRate Interface ---
+// PlaybackRate Interface
 static int32_t __cdecl mock_sl_rate_set_rate(void* self, int16_t rate) {
     auto* r = reinterpret_cast<MockPlayerRate*>(self);
     if (r && r->parent_player) {
@@ -162,7 +163,8 @@ static int32_t __cdecl mock_sl_rate_set_rate(void* self, int16_t rate) {
         SDL_LockMutex(g_audio_mutex);
         r->rate = rate;
         if (player->stream && rate > 0) {
-            int effective_rate = (player->src_rate * 1000) / rate;
+            int effective_rate = (player->src_rate * rate) / 1000;
+            if (effective_rate < 4000) effective_rate = 4000;
             SDL_FreeAudioStream(player->stream);
             player->stream = SDL_NewAudioStream(
                 AUDIO_S16SYS, player->src_channels, effective_rate,
@@ -173,11 +175,13 @@ static int32_t __cdecl mock_sl_rate_set_rate(void* self, int16_t rate) {
     }
     return 0;
 }
+
 static int32_t __cdecl mock_sl_rate_get_rate(void* self, int16_t* pRate) {
     auto* r = reinterpret_cast<MockPlayerRate*>(self);
     if (pRate) *pRate = r ? r->rate : 1000;
     return 0;
 }
+
 static int32_t __cdecl mock_sl_rate_get_rate_range(void* self, uint8_t idx, int16_t* pMin, int16_t* pMax, int16_t* pStep, uint32_t* pCaps) {
     if (pMin)  *pMin  = 500;
     if (pMax)  *pMax  = 2000;
@@ -186,7 +190,7 @@ static int32_t __cdecl mock_sl_rate_get_rate_range(void* self, uint8_t idx, int1
     return 0;
 }
 
-// --- Play Interface ---
+// Play Interface
 static int32_t __cdecl mock_sl_set_play_state(void* self, uint32_t state) {
     auto* play = reinterpret_cast<MockPlayerPlay*>(self);
     if (play && play->parent_player) {
@@ -202,6 +206,7 @@ static int32_t __cdecl mock_sl_set_play_state(void* self, uint32_t state) {
     }
     return 0;
 }
+
 static int32_t __cdecl mock_sl_get_play_state(void* self, uint32_t* pState) {
     if (pState) {
         auto* play = reinterpret_cast<MockPlayerPlay*>(self);
@@ -217,7 +222,7 @@ static int32_t __cdecl mock_sl_get_play_state(void* self, uint32_t* pState) {
     return 0;
 }
 
-// --- BufferQueue Interface ---
+// BufferQueue Interface
 static int32_t __cdecl mock_sl_get_state(void* self, void* pState) {
     if (pState) {
         auto* state = reinterpret_cast<FakeBufferQueueState*>(pState);
@@ -229,6 +234,7 @@ static int32_t __cdecl mock_sl_get_state(void* self, void* pState) {
     }
     return 0;
 }
+
 static int32_t __cdecl mock_sl_register_callback(void* self, slBufferQueueCallback callback, void* pContext) {
     auto* bq = reinterpret_cast<MockPlayerBQ*>(self);
     if (bq) {
@@ -239,6 +245,7 @@ static int32_t __cdecl mock_sl_register_callback(void* self, slBufferQueueCallba
     }
     return 0;
 }
+
 static int32_t __cdecl mock_sl_clear(void* self) {
     auto* bq = reinterpret_cast<MockPlayerBQ*>(self);
     if (bq) {
@@ -256,6 +263,7 @@ static int32_t __cdecl mock_sl_clear(void* self) {
     }
     return 0;
 }
+
 static int32_t __cdecl mock_sl_enqueue(void* self, const void* pBuf, uint32_t size) {
     auto* bq = reinterpret_cast<MockPlayerBQ*>(self);
     if (!bq || !pBuf || size == 0) return 0;
@@ -283,7 +291,7 @@ static int32_t __cdecl mock_sl_enqueue(void* self, const void* pBuf, uint32_t si
     return 0;
 }
 
-// --- Player Object Interface ---
+// Player Object Interface
 static int32_t __cdecl mock_player_obj_get_interface(void* self, const void* iid, void** pInterface) {
     if (!pInterface) return 0;
     auto* player = reinterpret_cast<MockAudioPlayer*>(self);
@@ -335,7 +343,7 @@ static void __cdecl mock_player_obj_destroy(void* self) {
     SDL_UnlockMutex(g_audio_mutex);
 }
 
-// --- Engine Interface ---
+// Engine Interface
 static int32_t __cdecl mock_engine_obj_get_interface(void* self, const void* iid, void** pInterface) {
     if (pInterface) *pInterface = &g_engine_itf_inst;
     return 0;
@@ -353,7 +361,7 @@ static int32_t __cdecl mock_engine_create_audio_player(void* self, void** pPlaye
     player->rate.parent_player   = player;
     player->rate.rate            = 1000;
     player->volume_scale         = 1.0f;
-    player->play_state           = 1; // STOPPED
+    player->play_state           = 1;
 
     player->src_channels = 2;
     player->src_rate     = 44100;
@@ -362,21 +370,17 @@ static int32_t __cdecl mock_engine_create_audio_player(void* self, void** pPlaye
         auto* src = reinterpret_cast<FakeSLDataSource*>(pSrc);
         if (src->pFormat) {
             auto* pcm = reinterpret_cast<FakeSLDataFormat_PCM*>(src->pFormat);
-            if (pcm->formatType == 2 || pcm->formatType == 1) { // SL_DATAFORMAT_PCM
-                player->src_channels = pcm->numChannels ? pcm->numChannels : 2;
-                uint32_t rate = pcm->samplesPerSec;
-                if (rate > 100000) {
-                    player->src_rate = rate / 1000;
-                } else if (rate > 0) {
-                    player->src_rate = rate;
+            if (pcm->formatType == 2 || pcm->formatType == 1) {
+                player->src_channels = (pcm->numChannels > 0) ? (int)pcm->numChannels : 1;
+                uint32_t raw_rate = pcm->samplesPerSec;
+                if (raw_rate > 100000) {
+                    player->src_rate = (int)(raw_rate / 1000);
+                } else if (raw_rate > 0) {
+                    player->src_rate = (int)raw_rate;
                 }
 
-                if (player->src_rate >= 44000 && player->src_rate <= 44200) player->src_rate = 44100;
-                else if (player->src_rate >= 22000 && player->src_rate <= 22100) player->src_rate = 22050;
-                else if (player->src_rate >= 47900 && player->src_rate <= 48100) player->src_rate = 48000;
-
-                printf("[Audio] Created player: %d channels, %d Hz (raw: %u)\n", 
-                       player->src_channels, player->src_rate, rate);
+                if (player->src_rate < 4000)  player->src_rate = 22050;
+                if (player->src_rate > 96000) player->src_rate = 44100;
             }
         }
     }
@@ -404,7 +408,7 @@ static int32_t __cdecl mock_engine_create_output_mix(void* self, void** pMix, ui
     return 0;
 }
 
-// Master Audio Mixer Hardware Callback
+// Master Audio Mixer Callback
 #define MIX_SCRATCH_SAMPLES 16384
 static void SDLCALL sdl_audio_mixer_callback(void* userdata, Uint8* stream, int len) {
     memset(stream, 0, len);
@@ -417,7 +421,7 @@ static void SDLCALL sdl_audio_mixer_callback(void* userdata, Uint8* stream, int 
     SDL_LockMutex(g_audio_mutex);
     for (int i = 0; i < MAX_ACTIVE_PLAYERS; i++) {
         MockAudioPlayer* player = g_active_players[i];
-        if (!player || player->play_state != 3 || !player->stream) continue; // 3 = PLAYING
+        if (!player || player->play_state != 3 || !player->stream) continue;
 
         int16_t temp_buf[MIX_SCRATCH_SAMPLES];
         int bytes_needed = num_samples * sizeof(int16_t);
@@ -431,7 +435,6 @@ static void SDLCALL sdl_audio_mixer_callback(void* userdata, Uint8* stream, int 
             }
         }
 
-        // Event-driven buffer refill check
         if (player->bq.callback && player->bq.queued_buffers > 0 &&
             !player->callback_pending && !player->refill_requested) {
             
@@ -463,7 +466,6 @@ static void SDLCALL sdl_audio_mixer_callback(void* userdata, Uint8* stream, int 
 static int SDLCALL audio_dispatch_thread(void* data) {
     SDL_LockMutex(g_audio_mutex);
     while (g_audio_running) {
-        // Sleep on condition variable, with 20ms safety fallback
         SDL_CondWaitTimeout(g_audio_cond, g_audio_mutex, 20);
 
         if (!g_audio_running) break;

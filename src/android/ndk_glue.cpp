@@ -116,6 +116,7 @@ static void __cdecl hook_AAsset_close(LocalAsset* a) {
 #define AMOTION_EVENT_AXIS_HAT_X     15
 #define AMOTION_EVENT_AXIS_HAT_Y     16
 
+
 static float __cdecl hook_AMotionEvent_getAxisValue(const void* ev, int32_t axis, size_t p) {
     if (!ev) return 0.0f;
     auto* e = static_cast<const MockInputEvent*>(ev);
@@ -123,11 +124,21 @@ static float __cdecl hook_AMotionEvent_getAxisValue(const void* ev, int32_t axis
     if (axis == AMOTION_EVENT_AXIS_Y || axis == AMOTION_EVENT_AXIS_HAT_Y) return e->axis_y;
     return 0.0f;
 }
+static int32_t  __cdecl hook_AKeyEvent_getFlags(void* ev)       { return 0; }
+static int32_t  __cdecl hook_AKeyEvent_getRepeatCount(void* ev) { return 0; }
+static int32_t  __cdecl hook_AKeyEvent_getMetaState(void* ev)   { return 0; }
+static int64_t  __cdecl hook_AKeyEvent_getDownTime(void* ev)    { return (int64_t)GetTickCount64() * 1000000LL; }
+static int64_t  __cdecl hook_AKeyEvent_getEventTime(void* ev)   { return (int64_t)GetTickCount64() * 1000000LL; }
 
 
 // -----------------------------------------------------------------------------
 // Symbol Registrations
 // -----------------------------------------------------------------------------
+REGISTER_SYMBOL_HOOK("AKeyEvent_getFlags", hook_AKeyEvent_getFlags);
+REGISTER_SYMBOL_HOOK("AKeyEvent_getRepeatCount", hook_AKeyEvent_getRepeatCount);
+REGISTER_SYMBOL_HOOK("AKeyEvent_getMetaState", hook_AKeyEvent_getMetaState);
+REGISTER_SYMBOL_HOOK("AKeyEvent_getDownTime", hook_AKeyEvent_getDownTime);
+REGISTER_SYMBOL_HOOK("AKeyEvent_getEventTime", hook_AKeyEvent_getEventTime);
 REGISTER_SYMBOL_HOOK("AMotionEvent_getAxisValue", hook_AMotionEvent_getAxisValue);
 REGISTER_SYMBOL_HOOK("AInputEvent_getType", hook_AInputEvent_getType);
 REGISTER_SYMBOL_HOOK("AInputEvent_getSource", hook_AInputEvent_getSource);

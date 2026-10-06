@@ -18,11 +18,11 @@
 #include "android/ndk_glue.h"
 #include "input/gamepad_bridge.h"
 
-
 // --- Global Host State ---
-static SDL_Window*   g_window     = nullptr;
-static SDL_GLContext g_gl_context = nullptr;
-static volatile int  g_running    = 1;
+static SDL_Window*         g_window     = nullptr;
+static SDL_GLContext       g_gl_context = nullptr;
+static SDL_GameController* g_controller = nullptr;
+static volatile int        g_running    = 1;
 
 ViewportState g_viewport;
 
@@ -36,6 +36,22 @@ static void toggle_fullscreen() {
     int nw = 0, nh = 0;
     SDL_GetWindowSize(g_window, &nw, &nh);
     g_viewport.update(nw, nh);
+}
+
+static void open_first_controller() {
+    if (g_controller) {
+        SDL_GameControllerClose(g_controller);
+        g_controller = nullptr;
+    }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            g_controller = SDL_GameControllerOpen(i);
+            if (g_controller) {
+                printf("[Input] Active Gamepad: %s\n", SDL_GameControllerName(g_controller));
+                break;
+            }
+        }
+    }
 }
 
 static DWORD WINAPI game_thread_entry(LPVOID arg) {
@@ -53,9 +69,7 @@ static DWORD WINAPI game_thread_entry(LPVOID arg) {
 
 static LONG WINAPI WindowsCrashHandler(EXCEPTION_POINTERS *ep) {
     uint32_t addr = (uint32_t)ep->ExceptionRecord->ExceptionAddress;
-    uint32_t *stack = (uint32_t*)ep->ContextRecord->Esp;
-
-    HMODULE hFaultMod = NULL;
+    HMODULE hFaultMod = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)addr, &hFaultMod);
     char faultMod[MAX_PATH] = "Unknown";
@@ -68,8 +82,7 @@ static LONG WINAPI WindowsCrashHandler(EXCEPTION_POINTERS *ep) {
     printf("\n======================================================\n");
     printf("[WINDOWS CRASH] Exception 0x%08X\n", (unsigned int)ep->ExceptionRecord->ExceptionCode);
     printf("Fault Address:    0x%08X [%s + 0x%X]\n", addr, faultMod, hFaultMod ? (addr - (uint32_t)hFaultMod) : 0);
-
-    printf("\nRegisters:\n");
+    printf("Registers:\n");
     printf("  EAX: 0x%08X  EBX: 0x%08X  ECX: 0x%08X  EDX: 0x%08X\n",
            (unsigned int)ep->ContextRecord->Eax, (unsigned int)ep->ContextRecord->Ebx,
            (unsigned int)ep->ContextRecord->Ecx, (unsigned int)ep->ContextRecord->Edx);
@@ -83,6 +96,7 @@ static LONG WINAPI WindowsCrashHandler(EXCEPTION_POINTERS *ep) {
 
 int main(int argc, char* argv[]) {
     SetUnhandledExceptionFilter(WindowsCrashHandler);
+
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     freopen("CONOUT$", "w", stderr);
@@ -113,8 +127,7 @@ int main(int argc, char* argv[]) {
     g_gl_context = SDL_GL_CreateContext(g_window);
     g_viewport.update(1280, 720);
 
-    //INIT TIME
-    init_fake_jni();
+    // Initialize all modular subsystems
     init_libc_compat();
     init_gl_wrappers();
     init_mock_opensles();
@@ -126,7 +139,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Set up Android Glue Structures
+    // Android App Glue Setup
     static FakeNativeActivity fake_activity;
     fake_activity.vm           = get_fake_jvm_ptr();
     fake_activity.env          = get_fake_jni_env_ptr();
@@ -146,31 +159,21 @@ int main(int argc, char* argv[]) {
     fake_app.userData = so.entry_android_main;
     set_global_app_ptr(&fake_app);
 
-    // Release context from Main Thread so Game Thread can take ownership
+    // Release context from Main Thread so Game Thread can claim it
     SDL_GL_MakeCurrent(g_window, nullptr);
 
     HANDLE hGameThread = CreateThread(nullptr, 0, game_thread_entry, &fake_app, 0, nullptr);
 
     while (fake_app.onAppCmd == nullptr) Sleep(10);
 
-    fake_app.onAppCmd(&fake_app, APP_CMD_INIT_WINDOW); // 1
-    fake_app.onAppCmd(&fake_app, APP_CMD_GAINED_FOCUS); // 6
+    fake_app.onAppCmd(&fake_app, APP_CMD_INIT_WINDOW);
+    fake_app.onAppCmd(&fake_app, APP_CMD_GAINED_FOCUS);
 
-    SDL_GameController* controller = nullptr;
-    for (int i = 0; i < SDL_NumJoysticks(); i++) {
-        if (SDL_IsGameController(i)) {
-            controller = SDL_GameControllerOpen(i);
-            if (controller) {
-                printf("[Input] Connected Gamepad: %s\n", SDL_GameControllerName(controller));
-                break;
-            }
-        }
-    }
+    open_first_controller();
 
     float stick_x = 0.0f, stick_y = 0.0f;
     int key_left = 0, key_right = 0, key_up = 0, key_down = 0;
     int dpad_left = 0, dpad_right = 0, dpad_up = 0, dpad_down = 0;
-    int was_stick_active = 0;
 
     // --- Main Event Loop ---
     while (g_running) {
@@ -182,6 +185,7 @@ int main(int argc, char* argv[]) {
                 break;
             }
 
+            // Window Resizing
             if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_RESIZED ||
                     ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
@@ -189,32 +193,57 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (ev.type == SDL_KEYDOWN) {
-                if (ev.key.keysym.sym == SDLK_RETURN && (ev.key.keysym.mod & KMOD_ALT)) {
+            // Controller Hotplugging
+            if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+                printf("[Input] Gamepad connected/reconnected\n");
+                open_first_controller();
+            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                printf("[Input] Gamepad disconnected\n");
+                open_first_controller();
+            }
+
+            // Keyboard Handling
+            if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+                int down = (ev.type == SDL_KEYDOWN) ? 1 : 0;
+
+                // Alt + Enter Fullscreen
+                if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_RETURN && (ev.key.keysym.mod & KMOD_ALT)) {
                     toggle_fullscreen();
                     continue;
                 }
-            }
 
-            // Keyboard input
-            if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
-                int down = (ev.type == SDL_KEYDOWN) ? 1 : 0;
-                int dpad_code = 0;
-
+                // Keyboard Start / Pause
                 if (ev.key.keysym.sym == SDLK_RETURN ||
                     ev.key.keysym.sym == SDLK_KP_ENTER ||
                     ev.key.keysym.sym == SDLK_SPACE ||
-                    ev.key.keysym.sym == SDLK_p ||
-                    ev.key.keysym.sym == SDLK_ESCAPE) {
-                    GamePadMgrBridge::dispatchStartPress(down);
+                    ev.key.keysym.sym == SDLK_p) {
+                    if (down) GamePadMgrBridge::dispatchStartPress(1);
                     continue;
                 }
 
+                // Keyboard Android Back Button
+                if (ev.key.keysym.sym == SDLK_ESCAPE ||
+                    ev.key.keysym.sym == SDLK_BACKSPACE) {
+                    MockInputEvent ev_back;
+                    memset(&ev_back, 0, sizeof(ev_back));
+                    ev_back.type      = AINPUT_EVENT_TYPE_KEY;
+                    ev_back.source    = AINPUT_SOURCE_KEYBOARD;
+                    ev_back.deviceId  = 1;
+                    ev_back.keyCode   = AKEYCODE_BACK;
+                    ev_back.keyAction = down ? AKEY_EVENT_ACTION_DOWN : AKEY_EVENT_ACTION_UP;
+                    dispatch_raw_input_event(&ev_back);
+                    continue;
+                }
+
+                // Directional Keys (WASD / Arrows)
+                int dpad_code = 0;
                 switch (ev.key.keysym.sym) {
                     case SDLK_a: case SDLK_LEFT:  key_left = down;  dpad_code = AKEYCODE_DPAD_LEFT;  break;
                     case SDLK_d: case SDLK_RIGHT: key_right = down; dpad_code = AKEYCODE_DPAD_RIGHT; break;
                     case SDLK_w: case SDLK_UP:    key_up = down;    dpad_code = AKEYCODE_DPAD_UP;    break;
                     case SDLK_s: case SDLK_DOWN:  key_down = down;  dpad_code = AKEYCODE_DPAD_DOWN;  break;
+
+                    // Combat Buttons
                     case SDLK_j: case SDLK_z: GamePadMgrBridge::dispatchButton(AKEYCODE_BUTTON_A, down); break;
                     case SDLK_u: case SDLK_x: GamePadMgrBridge::dispatchButton(AKEYCODE_BUTTON_X, down); break;
                     case SDLK_i: case SDLK_c: GamePadMgrBridge::dispatchButton(AKEYCODE_BUTTON_Y, down); break;
@@ -222,17 +251,16 @@ int main(int argc, char* argv[]) {
                     case SDLK_q:              GamePadMgrBridge::dispatchButton(AKEYCODE_BUTTON_L1, down); break;
                     case SDLK_e:              GamePadMgrBridge::dispatchButton(AKEYCODE_BUTTON_R1, down); break;
                 }
-
                 if (dpad_code != 0) {
                     GamePadMgrBridge::dispatchDpad(dpad_code, down);
                 }
             }
 
-            // Gamepad Analog
-            if (ev.type == SDL_CONTROLLERAXISMOTION && controller) {
+            // Gamepad Analog Stick
+            if (ev.type == SDL_CONTROLLERAXISMOTION && g_controller) {
                 if (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX || ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) {
-                    float ax = (float)SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
-                    float ay = (float)SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
+                    float ax = (float)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
+                    float ay = (float)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
                     if (fabsf(ax) < 0.20f) ax = 0.0f;
                     if (fabsf(ay) < 0.20f) ay = 0.0f;
                     stick_x = ax;
@@ -241,23 +269,26 @@ int main(int argc, char* argv[]) {
             }
 
             // Gamepad Buttons
-            if ((ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) && controller) {
+            // Gamepad Buttons
+            if ((ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) && g_controller) {
                 int down = (ev.type == SDL_CONTROLLERBUTTONDOWN) ? 1 : 0;
-                int code = 0, dpad_code = 0;
 
-                if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+                // Both Start and Back trigger Pause (AKEYCODE_BUTTON_SELECT with KEYBOARD source)
+                if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_START ||
+                    ev.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
                     GamePadMgrBridge::dispatchStartPress(down);
-                } else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
-                    GamePadMgrBridge::dispatchButton(AKEYCODE_BACK, down);
+                    continue;
                 }
 
+                int code = 0, dpad_code = 0;
                 switch (ev.cbutton.button) {
-                    case SDL_CONTROLLER_BUTTON_A:             code = AKEYCODE_BUTTON_A; break;
-                    case SDL_CONTROLLER_BUTTON_X:             code = AKEYCODE_BUTTON_X; break;
-                    case SDL_CONTROLLER_BUTTON_Y:             code = AKEYCODE_BUTTON_Y; break;
-                    case SDL_CONTROLLER_BUTTON_B:             code = AKEYCODE_BUTTON_B; break;
-                    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  code = AKEYCODE_BUTTON_L1; break;
-                    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: code = AKEYCODE_BUTTON_R1; break;
+                    case SDL_CONTROLLER_BUTTON_A:             code = AKEYCODE_BUTTON_A; break;  // Guard
+                    case SDL_CONTROLLER_BUTTON_X:             code = AKEYCODE_BUTTON_X; break;  // Horizontal Attack
+                    case SDL_CONTROLLER_BUTTON_Y:             code = AKEYCODE_BUTTON_Y; break;  // Vertical Attack
+                    case SDL_CONTROLLER_BUTTON_B:             code = AKEYCODE_BUTTON_B; break;  // Kick
+                    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  code = AKEYCODE_BUTTON_A; break;  // L1 = Guard
+                    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: code = AKEYCODE_BUTTON_R1; break; // R1 = A+B+K Macro
+
                     case SDL_CONTROLLER_BUTTON_DPAD_UP:    dpad_up = down;    dpad_code = AKEYCODE_DPAD_UP;    break;
                     case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  dpad_down = down;  dpad_code = AKEYCODE_DPAD_DOWN;  break;
                     case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  dpad_left = down;  dpad_code = AKEYCODE_DPAD_LEFT;  break;
@@ -268,7 +299,7 @@ int main(int argc, char* argv[]) {
                 if (code != 0)      GamePadMgrBridge::dispatchButton(code, down);
             }
 
-            // Mouse / Touch Scaling
+            // Mouse Touch Translation
             if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) {
                 float gx = 0.0f, gy = 0.0f;
                 g_viewport.windowToGame((float)ev.button.x, (float)ev.button.y, &gx, &gy);
@@ -286,42 +317,50 @@ int main(int argc, char* argv[]) {
 
         if (!g_running) break;
 
+        // Combine stick & keyboard deflection
         float cur_x = stick_x, cur_y = stick_y;
         if (cur_x == 0.0f && cur_y == 0.0f) {
             cur_x = (float)((key_right || dpad_right) - (key_left || dpad_left));
             cur_y = (float)((key_down || dpad_down) - (key_up || dpad_up));
         }
 
-        if (fabsf(cur_x) > 0.05f || fabsf(cur_y) > 0.05f) {
+        static float s_last_sent_x = 0.0f;
+        static float s_last_sent_y = 0.0f;
+
+        // Dispatch motion only on state changes (prevents queue congestion)
+        if (fabsf(cur_x - s_last_sent_x) > 0.05f || fabsf(cur_y - s_last_sent_y) > 0.05f) {
             GamePadMgrBridge::dispatchMotionFrame(cur_x, cur_y);
-            was_stick_active = 1;
-        } else if (was_stick_active) {
-            GamePadMgrBridge::dispatchMotionFrame(0.0f, 0.0f);
-            was_stick_active = 0;
+            s_last_sent_x = cur_x;
+            s_last_sent_y = cur_y;
         }
 
         Sleep(16);
     }
 
-    // --- Fast Clean Shutdown ---
-    printf("[Shutdown] Step 1: Stopping audio subsystem...\n");
+    // --- Fast, Clean Shutdown Sequence ---
+    printf("[Shutdown] Step 1: Stopping audio mixer...\n");
     shutdown_mock_opensles();
 
-    printf("[Shutdown] Step 2: Terminating game thread...\n");
+    printf("[Shutdown] Step 2: Terminating background game thread...\n");
     if (hGameThread) {
         TerminateThread(hGameThread, 0);
         CloseHandle(hGameThread);
     }
 
     printf("[Shutdown] Step 3: Releasing SDL & OpenGL resources...\n");
-    if (controller) SDL_GameControllerClose(controller);
+    if (g_controller) {
+        SDL_GameControllerClose(g_controller);
+        g_controller = nullptr;
+    }
     if (g_gl_context) {
         SDL_GL_MakeCurrent(g_window, nullptr);
         SDL_GL_DeleteContext(g_gl_context);
     }
-    if (g_window) SDL_DestroyWindow(g_window);
+    if (g_window) {
+        SDL_DestroyWindow(g_window);
+    }
 
     SDL_Quit();
-    printf("[Shutdown] Complete.\n");
+    printf("[Shutdown] Clean exit complete.\n");
     ExitProcess(0);
 }

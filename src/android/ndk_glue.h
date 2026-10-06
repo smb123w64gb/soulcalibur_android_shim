@@ -31,6 +31,7 @@
 #define AKEYCODE_BUTTON_L1           102
 #define AKEYCODE_BUTTON_R1           103
 #define AKEYCODE_BUTTON_START        108
+#define AKEYCODE_BUTTON_SELECT       109
 #define AKEYCODE_ESCAPE              111
 
 enum {
